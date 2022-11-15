@@ -399,7 +399,7 @@ func nilGetBase(context.Context, string) (name.Reference, Result, error) {
 const wantSBOM = "This is our fake SBOM"
 
 // A helper method we use to substitute for the default "build" method.
-func fauxSBOM(context.Context, string, string, oci.SignedEntity) ([]byte, types.MediaType, error) {
+func fauxSBOM(context.Context, string, string, string, oci.SignedEntity, string) ([]byte, types.MediaType, error) {
 	return []byte(wantSBOM), "application/vnd.garbage", nil
 }
 
@@ -437,6 +437,7 @@ func TestGoBuildNoKoData(t *testing.T) {
 		WithBaseImages(func(context.Context, string) (name.Reference, Result, error) { return baseRef, base, nil }),
 		withBuilder(writeTempFile),
 		withSBOMber(fauxSBOM),
+		WithPlatforms("all"),
 	)
 	if err != nil {
 		t.Fatalf("NewGo() = %v", err)
@@ -719,6 +720,7 @@ func TestGoBuild(t *testing.T) {
 		withSBOMber(fauxSBOM),
 		WithLabel("foo", "bar"),
 		WithLabel("hello", "world"),
+		WithPlatforms("all"),
 	)
 	if err != nil {
 		t.Fatalf("NewGo() = %v", err)
@@ -794,6 +796,7 @@ func TestGoBuildWithKOCACHE(t *testing.T) {
 		"",
 		WithCreationTime(creationTime),
 		WithBaseImages(func(context.Context, string) (name.Reference, Result, error) { return baseRef, base, nil }),
+		WithPlatforms("all"),
 	)
 	if err != nil {
 		t.Fatalf("NewGo() = %v", err)
@@ -831,6 +834,7 @@ func TestGoBuildWithoutSBOM(t *testing.T) {
 		WithLabel("foo", "bar"),
 		WithLabel("hello", "world"),
 		WithDisabledSBOM(),
+		WithPlatforms("all"),
 	)
 	if err != nil {
 		t.Fatalf("NewGo() = %v", err)
@@ -1183,6 +1187,7 @@ func TestGoBuildConsistentMediaTypes(t *testing.T) {
 				WithBaseImages(func(context.Context, string) (name.Reference, Result, error) { return baseRef, base, nil }),
 				withBuilder(writeTempFile),
 				withSBOMber(fauxSBOM),
+				WithPlatforms("all"),
 			)
 			if err != nil {
 				t.Fatalf("NewGo() = %v", err)

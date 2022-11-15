@@ -120,6 +120,10 @@ func gobuildOptions(bo *options.BuildOptions) ([]build.Option, error) {
 		opts = append(opts, build.WithConfig(bo.BuildConfigs))
 	}
 
+	if bo.SBOMDir != "" {
+		opts = append(opts, build.WithSBOMDir(bo.SBOMDir))
+	}
+
 	return opts, nil
 }
 
@@ -163,21 +167,34 @@ func NewPublisher(po *options.PublishOptions) (publish.Interface, error) {
 }
 
 func makePublisher(po *options.PublishOptions) (publish.Interface, error) {
+	// use each tag only once
+	po.Tags = unique(po.Tags)
 	// Create the publish.Interface that we will use to publish image references
 	// to either a docker daemon or a container image registry.
 	innerPublisher, err := func() (publish.Interface, error) {
 		repoName := po.DockerRepo
 		namer := options.MakeNamer(po)
-		if repoName == publish.LocalDomain || po.Local {
+		// Default LocalDomain if unset.
+		if po.LocalDomain == "" {
+			po.LocalDomain = publish.LocalDomain
+		}
+		// If repoName is unset with --local, default it to the local domain.
+		if po.Local && repoName == "" {
+			repoName = po.LocalDomain
+		}
+		// When in doubt, if repoName is under the local domain, default to --local.
+		po.Local = strings.HasPrefix(repoName, po.LocalDomain)
+		if po.Local {
 			// TODO(jonjohnsonjr): I'm assuming that nobody will
 			// use local with other publishers, but that might
 			// not be true.
+			po.LocalDomain = repoName
 			return publish.NewDaemon(namer, po.Tags,
 				publish.WithDockerClient(po.DockerClient),
 				publish.WithLocalDomain(po.LocalDomain),
 			)
 		}
-		if repoName == publish.KindDomain {
+		if strings.HasPrefix(repoName, publish.KindDomain) {
 			return publish.NewKindPublisher(namer, po.Tags), nil
 		}
 
@@ -224,9 +241,16 @@ func makePublisher(po *options.PublishOptions) (publish.Interface, error) {
 		// If not publishing, at least generate a digest to simulate
 		// publishing.
 		if len(publishers) == 0 {
+			// If one or more tags are specified, use the first tag in the list
+			var tag string
+			if len(po.Tags) >= 1 {
+				tag = po.Tags[0]
+			}
 			publishers = append(publishers, nopPublisher{
 				repoName: repoName,
 				namer:    namer,
+				tag:      tag,
+				tagOnly:  po.TagOnly,
 			})
 		}
 
@@ -237,7 +261,7 @@ func makePublisher(po *options.PublishOptions) (publish.Interface, error) {
 	}
 
 	if po.ImageRefsFile != "" {
-		f, err := os.OpenFile(po.ImageRefsFile, os.O_RDWR|os.O_CREATE, 0644)
+		f, err := os.OpenFile(po.ImageRefsFile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 		if err != nil {
 			return nil, err
 		}
@@ -256,15 +280,27 @@ func makePublisher(po *options.PublishOptions) (publish.Interface, error) {
 type nopPublisher struct {
 	repoName string
 	namer    publish.Namer
+	tag      string
+	tagOnly  bool
 }
 
 func (n nopPublisher) Publish(_ context.Context, br build.Result, s string) (name.Reference, error) {
 	s = strings.TrimPrefix(s, build.StrictScheme)
+	nm := n.namer(n.repoName, s)
+	if n.tagOnly {
+		if n.tag == "" {
+			return nil, errors.New("must specify tag if requesting tag only")
+		}
+		return name.NewTag(fmt.Sprintf("%s:%s", nm, n.tag))
+	}
 	h, err := br.Digest()
 	if err != nil {
 		return nil, err
 	}
-	return name.NewDigest(fmt.Sprintf("%s@%s", n.namer(n.repoName, s), h))
+	if n.tag == "" {
+		return name.NewDigest(fmt.Sprintf("%s@%s", nm, h))
+	}
+	return name.NewDigest(fmt.Sprintf("%s:%s@%s", nm, n.tag, h))
 }
 
 func (n nopPublisher) Close() error { return nil }
@@ -363,7 +399,7 @@ func ResolveFilesToWriter(
 	}
 
 	// Make sure we exit with an error.
-	// See https://github.com/google/ko/issues/84
+	// See https://github.com/ko-build/ko/issues/84
 	return errs.Wait()
 }
 
@@ -435,4 +471,20 @@ func resolveFile(
 	e.Close()
 
 	return buf.Bytes(), nil
+}
+
+// create a set from the input slice
+// preserving the order of unique elements
+func unique(ss []string) []string {
+	var (
+		seen = make(map[string]struct{}, len(ss))
+		uniq = make([]string, 0, len(ss))
+	)
+	for _, s := range ss {
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			uniq = append(uniq, s)
+		}
+	}
+	return uniq
 }
