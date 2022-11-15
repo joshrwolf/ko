@@ -23,14 +23,12 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"os"
 	"path"
 	"strings"
 	"sync"
 
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/mattmoor/dep-notify/pkg/graph"
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v3"
 	"k8s.io/apimachinery/pkg/labels"
@@ -122,6 +120,10 @@ func gobuildOptions(bo *options.BuildOptions) ([]build.Option, error) {
 		opts = append(opts, build.WithConfig(bo.BuildConfigs))
 	}
 
+	if bo.SBOMDir != "" {
+		opts = append(opts, build.WithSBOMDir(bo.SBOMDir))
+	}
+
 	return opts, nil
 }
 
@@ -150,9 +152,6 @@ func makeBuilder(ctx context.Context, bo *options.BuildOptions) (*build.Caching,
 	//    - if a valid Build future exists at the time of the request,
 	//      then block on it.
 	//    - if it does not, then initiate and record a Build future.
-	//  - When import paths are "affected" by filesystem changes during a
-	//    Watch, then invalidate their build futures *before* we put the
-	//    affected yaml files onto the channel
 	//
 	// This will benefit the following key cases:
 	// 1. When the same import path is referenced across multiple yaml files
@@ -168,21 +167,34 @@ func NewPublisher(po *options.PublishOptions) (publish.Interface, error) {
 }
 
 func makePublisher(po *options.PublishOptions) (publish.Interface, error) {
+	// use each tag only once
+	po.Tags = unique(po.Tags)
 	// Create the publish.Interface that we will use to publish image references
 	// to either a docker daemon or a container image registry.
 	innerPublisher, err := func() (publish.Interface, error) {
 		repoName := po.DockerRepo
 		namer := options.MakeNamer(po)
-		if repoName == publish.LocalDomain || po.Local {
+		// Default LocalDomain if unset.
+		if po.LocalDomain == "" {
+			po.LocalDomain = publish.LocalDomain
+		}
+		// If repoName is unset with --local, default it to the local domain.
+		if po.Local && repoName == "" {
+			repoName = po.LocalDomain
+		}
+		// When in doubt, if repoName is under the local domain, default to --local.
+		po.Local = strings.HasPrefix(repoName, po.LocalDomain)
+		if po.Local {
 			// TODO(jonjohnsonjr): I'm assuming that nobody will
 			// use local with other publishers, but that might
 			// not be true.
+			po.LocalDomain = repoName
 			return publish.NewDaemon(namer, po.Tags,
 				publish.WithDockerClient(po.DockerClient),
 				publish.WithLocalDomain(po.LocalDomain),
 			)
 		}
-		if repoName == publish.KindDomain {
+		if strings.HasPrefix(repoName, publish.KindDomain) {
 			return publish.NewKindPublisher(namer, po.Tags), nil
 		}
 
@@ -229,9 +241,16 @@ func makePublisher(po *options.PublishOptions) (publish.Interface, error) {
 		// If not publishing, at least generate a digest to simulate
 		// publishing.
 		if len(publishers) == 0 {
+			// If one or more tags are specified, use the first tag in the list
+			var tag string
+			if len(po.Tags) >= 1 {
+				tag = po.Tags[0]
+			}
 			publishers = append(publishers, nopPublisher{
 				repoName: repoName,
 				namer:    namer,
+				tag:      tag,
+				tagOnly:  po.TagOnly,
 			})
 		}
 
@@ -242,7 +261,7 @@ func makePublisher(po *options.PublishOptions) (publish.Interface, error) {
 	}
 
 	if po.ImageRefsFile != "" {
-		f, err := os.OpenFile(po.ImageRefsFile, os.O_RDWR|os.O_CREATE, 0600)
+		f, err := os.OpenFile(po.ImageRefsFile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 		if err != nil {
 			return nil, err
 		}
@@ -261,15 +280,27 @@ func makePublisher(po *options.PublishOptions) (publish.Interface, error) {
 type nopPublisher struct {
 	repoName string
 	namer    publish.Namer
+	tag      string
+	tagOnly  bool
 }
 
 func (n nopPublisher) Publish(_ context.Context, br build.Result, s string) (name.Reference, error) {
 	s = strings.TrimPrefix(s, build.StrictScheme)
+	nm := n.namer(n.repoName, s)
+	if n.tagOnly {
+		if n.tag == "" {
+			return nil, errors.New("must specify tag if requesting tag only")
+		}
+		return name.NewTag(fmt.Sprintf("%s:%s", nm, n.tag))
+	}
 	h, err := br.Digest()
 	if err != nil {
 		return nil, err
 	}
-	return name.NewDigest(fmt.Sprintf("%s@%s", n.namer(n.repoName, s), h))
+	if n.tag == "" {
+		return name.NewDigest(fmt.Sprintf("%s@%s", nm, h))
+	}
+	return name.NewDigest(fmt.Sprintf("%s:%s@%s", nm, n.tag, h))
 }
 
 func (n nopPublisher) Close() error { return nil }
@@ -277,7 +308,7 @@ func (n nopPublisher) Close() error { return nil }
 // resolvedFuture represents a "future" for the bytes of a resolved file.
 type resolvedFuture chan []byte
 
-func resolveFilesToWriter(
+func ResolveFilesToWriter(
 	ctx context.Context,
 	builder *build.Caching,
 	publisher publish.Interface,
@@ -294,38 +325,6 @@ func resolveFilesToWriter(
 
 	// This tracks filename -> []importpath
 	var sm sync.Map
-
-	var g graph.Interface
-	var errCh chan error
-	var err error
-	if fo.Watch {
-		// Start a dep-notify process that on notifications scans the
-		// file-to-recorded-build map and for each affected file resends
-		// the filename along the channel.
-		g, errCh, err = graph.New(func(ss graph.StringSet) {
-			sm.Range(func(k, v interface{}) bool {
-				key := k.(string)
-				value := v.([]string)
-
-				for _, ip := range value {
-					// dep-notify doesn't understand the ko:// prefix
-					ip := strings.TrimPrefix(ip, build.StrictScheme)
-					if ss.Has(ip) {
-						// See the comment above about how "builder" works.
-						// Always use ko:// for the builder.
-						builder.Invalidate(build.StrictScheme + ip)
-						fs <- key
-					}
-				}
-				return true
-			})
-		})
-		if err != nil {
-			return fmt.Errorf("creating dep-notify graph: %w", err)
-		}
-		// Cleanup the fsnotify hooks when we're done.
-		defer g.Shutdown()
-	}
 
 	// This tracks resolution errors and ensures we cancel other builds if an
 	// individual build fails.
@@ -376,33 +375,11 @@ func resolveFilesToWriter(
 				if err != nil {
 					// This error is sometimes expected during watch mode, so this
 					// isn't fatal. Just print it and keep the watch open.
-					err := fmt.Errorf("error processing import paths in %q: %w", f, err)
-					if fo.Watch {
-						log.Print(err)
-						return nil
-					}
-					return err
+					return fmt.Errorf("error processing import paths in %q: %w", f, err)
 				}
 				// Associate with this file the collection of binary import paths.
 				sm.Store(f, recordingBuilder.ImportPaths)
 				ch <- b
-				if fo.Watch {
-					for _, ip := range recordingBuilder.ImportPaths {
-						// dep-notify doesn't understand the ko:// prefix
-						ip := strings.TrimPrefix(ip, build.StrictScheme)
-
-						// Technically we never remove binary targets from the graph,
-						// which will increase our graph's watch load, but the
-						// notifications that they change will result in no affected
-						// yamls, and no new builds or deploys.
-						if err := g.Add(ip); err != nil {
-							// If we're in watch mode, just fail.
-							err := fmt.Errorf("adding importpath %q to dep graph: %w", ip, err)
-							errCh <- err
-							return err
-						}
-					}
-				}
 				return nil
 			})
 
@@ -418,14 +395,11 @@ func resolveFilesToWriter(
 				// be applied.
 				out.Write(append(b, []byte("\n---\n")...))
 			}
-
-		case err := <-errCh:
-			return fmt.Errorf("watching dependencies: %w", err)
 		}
 	}
 
 	// Make sure we exit with an error.
-	// See https://github.com/google/ko/issues/84
+	// See https://github.com/ko-build/ko/issues/84
 	return errs.Wait()
 }
 
@@ -497,4 +471,20 @@ func resolveFile(
 	e.Close()
 
 	return buf.Bytes(), nil
+}
+
+// create a set from the input slice
+// preserving the order of unique elements
+func unique(ss []string) []string {
+	var (
+		seen = make(map[string]struct{}, len(ss))
+		uniq = make([]string, 0, len(ss))
+	)
+	for _, s := range ss {
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			uniq = append(uniq, s)
+		}
+	}
+	return uniq
 }

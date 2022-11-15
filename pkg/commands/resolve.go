@@ -55,6 +55,10 @@ func addResolve(topLevel *cobra.Command) {
   ko resolve --local -f config/`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := options.Validate(po, bo); err != nil {
+				return fmt.Errorf("validating options: %w", err)
+			}
+
 			ctx := cmd.Context()
 			bo.InsecureRegistry = po.InsecureRegistry
 
@@ -73,7 +77,7 @@ func addResolve(topLevel *cobra.Command) {
 				return fmt.Errorf("error creating publisher: %w", err)
 			}
 			defer publisher.Close()
-			return resolveFilesToWriter(ctx, builder, publisher, fo, so, os.Stdout)
+			return ResolveFilesToWriter(ctx, builder, publisher, fo, so, os.Stdout)
 		},
 	}
 	options.AddPublishArg(resolve, po)

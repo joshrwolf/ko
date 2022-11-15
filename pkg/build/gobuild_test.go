@@ -392,14 +392,14 @@ func TestBuildConfig(t *testing.T) {
 	}
 }
 
-func nilGetBase(_ context.Context, _ string) (name.Reference, Result, error) {
+func nilGetBase(context.Context, string) (name.Reference, Result, error) {
 	return nil, nil, nil
 }
 
 const wantSBOM = "This is our fake SBOM"
 
 // A helper method we use to substitute for the default "build" method.
-func fauxSBOM(_ context.Context, _ string, _ string, _ v1.Image) ([]byte, types.MediaType, error) {
+func fauxSBOM(context.Context, string, string, string, oci.SignedEntity, string) ([]byte, types.MediaType, error) {
 	return []byte(wantSBOM), "application/vnd.garbage", nil
 }
 
@@ -437,6 +437,7 @@ func TestGoBuildNoKoData(t *testing.T) {
 		WithBaseImages(func(context.Context, string) (name.Reference, Result, error) { return baseRef, base, nil }),
 		withBuilder(writeTempFile),
 		withSBOMber(fauxSBOM),
+		WithPlatforms("all"),
 	)
 	if err != nil {
 		t.Fatalf("NewGo() = %v", err)
@@ -449,7 +450,7 @@ func TestGoBuildNoKoData(t *testing.T) {
 
 	img, ok := result.(v1.Image)
 	if !ok {
-		t.Fatalf("Build() not an image: %v", result)
+		t.Fatalf("Build() not an Image: %T", result)
 	}
 
 	ls, err := img.Layers()
@@ -719,6 +720,7 @@ func TestGoBuild(t *testing.T) {
 		withSBOMber(fauxSBOM),
 		WithLabel("foo", "bar"),
 		WithLabel("hello", "world"),
+		WithPlatforms("all"),
 	)
 	if err != nil {
 		t.Fatalf("NewGo() = %v", err)
@@ -731,7 +733,7 @@ func TestGoBuild(t *testing.T) {
 
 	img, ok := result.(oci.SignedImage)
 	if !ok {
-		t.Fatalf("Build() not an image: %v", result)
+		t.Fatalf("Build() not a SignedImage: %T", result)
 	}
 
 	validateImage(t, img, baseLayers, creationTime, true, true)
@@ -794,6 +796,7 @@ func TestGoBuildWithKOCACHE(t *testing.T) {
 		"",
 		WithCreationTime(creationTime),
 		WithBaseImages(func(context.Context, string) (name.Reference, Result, error) { return baseRef, base, nil }),
+		WithPlatforms("all"),
 	)
 	if err != nil {
 		t.Fatalf("NewGo() = %v", err)
@@ -831,6 +834,7 @@ func TestGoBuildWithoutSBOM(t *testing.T) {
 		WithLabel("foo", "bar"),
 		WithLabel("hello", "world"),
 		WithDisabledSBOM(),
+		WithPlatforms("all"),
 	)
 	if err != nil {
 		t.Fatalf("NewGo() = %v", err)
@@ -843,7 +847,7 @@ func TestGoBuildWithoutSBOM(t *testing.T) {
 
 	img, ok := result.(oci.SignedImage)
 	if !ok {
-		t.Fatalf("Build() not an image: %v", result)
+		t.Fatalf("Build() not a SignedImage: %T", result)
 	}
 
 	validateImage(t, img, baseLayers, creationTime, true, false)
@@ -879,7 +883,7 @@ func TestGoBuildIndex(t *testing.T) {
 
 	idx, ok := result.(oci.SignedImageIndex)
 	if !ok {
-		t.Fatalf("Build() not an image: %v", result)
+		t.Fatalf("Build() not a SignedImageIndex: %T", result)
 	}
 
 	im, err := idx.IndexManifest()
@@ -1150,5 +1154,79 @@ func TestMatchesPlatformSpec(t *testing.T) {
 		if got, want := matches, tc.result; got != want {
 			t.Errorf("wrong result for %v %q: want %t got %t", tc.platform, tc.spec, want, got)
 		}
+	}
+}
+
+func TestGoBuildConsistentMediaTypes(t *testing.T) {
+	for _, c := range []struct {
+		desc                      string
+		mediaType, layerMediaType types.MediaType
+	}{{
+		desc:           "docker types",
+		mediaType:      types.DockerManifestSchema2,
+		layerMediaType: types.DockerLayer,
+	}, {
+		desc:           "oci types",
+		mediaType:      types.OCIManifestSchema1,
+		layerMediaType: types.OCILayer,
+	}} {
+		t.Run(c.desc, func(t *testing.T) {
+			base := mutate.MediaType(empty.Image, c.mediaType)
+			l, err := random.Layer(10, c.layerMediaType)
+			if err != nil {
+				t.Fatal(err)
+			}
+			base, err = mutate.AppendLayers(base, l)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			ng, err := NewGo(
+				context.Background(),
+				"",
+				WithBaseImages(func(context.Context, string) (name.Reference, Result, error) { return baseRef, base, nil }),
+				withBuilder(writeTempFile),
+				withSBOMber(fauxSBOM),
+				WithPlatforms("all"),
+			)
+			if err != nil {
+				t.Fatalf("NewGo() = %v", err)
+			}
+
+			importpath := "github.com/google/ko"
+
+			result, err := ng.Build(context.Background(), StrictScheme+importpath)
+			if err != nil {
+				t.Fatalf("Build() = %v", err)
+			}
+
+			img, ok := result.(v1.Image)
+			if !ok {
+				t.Fatalf("Build() not an Image: %T", result)
+			}
+
+			ls, err := img.Layers()
+			if err != nil {
+				t.Fatalf("Layers() = %v", err)
+			}
+
+			for i, l := range ls {
+				gotMT, err := l.MediaType()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if gotMT != c.layerMediaType {
+					t.Errorf("layer %d: got mediaType %q, want %q", i, gotMT, c.layerMediaType)
+				}
+			}
+
+			gotMT, err := img.MediaType()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotMT != c.mediaType {
+				t.Errorf("got image mediaType %q, want %q", gotMT, c.layerMediaType)
+			}
+		})
 	}
 }

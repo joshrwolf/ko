@@ -32,7 +32,7 @@ import (
 
 const (
 	// configDefaultBaseImage is the default base image if not specified in .ko.yaml.
-	configDefaultBaseImage = "gcr.io/distroless/static:nonroot"
+	configDefaultBaseImage = "distroless.dev/static:latest"
 )
 
 // BuildOptions represents options for the ko builder.
@@ -51,6 +51,7 @@ type BuildOptions struct {
 	ConcurrentBuilds     int
 	DisableOptimizations bool
 	SBOM                 string
+	SBOMDir              string
 	Platforms            []string
 	Labels               []string
 	// UserAgent enables overriding the default value of the `User-Agent` HTTP
@@ -75,7 +76,9 @@ func AddBuildOptions(cmd *cobra.Command, bo *BuildOptions) {
 	cmd.Flags().BoolVar(&bo.DisableOptimizations, "disable-optimizations", bo.DisableOptimizations,
 		"Disable optimizations when building Go code. Useful when you want to interactively debug the created container.")
 	cmd.Flags().StringVar(&bo.SBOM, "sbom", "spdx",
-		"The SBOM media type to use (none will disable SBOM synthesis and upload, also supports: spdx, go.version-m).")
+		"The SBOM media type to use (none will disable SBOM synthesis and upload, also supports: spdx, cyclonedx, go.version-m).")
+	cmd.Flags().StringVar(&bo.SBOMDir, "sbom-dir", "",
+		"Path to file where the SBOM will be written.")
 	cmd.Flags().StringSliceVar(&bo.Platforms, "platform", []string{},
 		"Which platform to use when pulling a multi-platform base. Format: all | <os>[/<arch>[/<variant>]][,platform]*")
 	cmd.Flags().StringSliceVar(&bo.Labels, "image-label", []string{},
@@ -98,11 +101,21 @@ func (bo *BuildOptions) LoadConfig() error {
 	v.AutomaticEnv()
 
 	if override := os.Getenv("KO_CONFIG_PATH"); override != "" {
-		path := filepath.Join(override, configName+".yaml")
-		file, err := os.Stat(path)
+		file, err := os.Stat(override)
 		if err != nil {
 			return fmt.Errorf("error looking for config file: %w", err)
 		}
+		var path string
+		if file.IsDir() {
+			path = filepath.Join(override, configName+".yaml")
+			file, err = os.Stat(path)
+			if err != nil {
+				return fmt.Errorf("error looking for config file: %w", err)
+			}
+		} else {
+			path = override
+		}
+
 		if !file.Mode().IsRegular() {
 			return fmt.Errorf("config file %s is not a regular file", path)
 		}

@@ -183,6 +183,7 @@ func TestNewBuilder(t *testing.T) {
 			bo: &options.BuildOptions{
 				BaseImage:        baseImage,
 				ConcurrentBuilds: 1,
+				Platforms:        []string{"all"},
 			},
 			wantQualifiedImportpath: "ko://github.com/google/ko/test",
 			shouldBuildError:        false,
@@ -277,6 +278,15 @@ func TestNewPublisherCanPublish(t *testing.T) {
 			},
 			shouldError: true,
 			wantError:   errImageLoad,
+		},
+		{
+			description:   "bare with local domain and repo",
+			wantImageName: strings.ToLower(fmt.Sprintf("%s/foo", dockerRepo)),
+			po: &options.PublishOptions{
+				DockerRepo: dockerRepo + "/foo",
+				Local:      true,
+				Bare:       true,
+			},
 		},
 	}
 	for _, test := range tests {

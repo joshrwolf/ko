@@ -30,6 +30,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/ko/internal/sbom"
+	"github.com/sigstore/cosign/pkg/oci/signed"
 	"github.com/spf13/cobra"
 )
 
@@ -45,14 +46,15 @@ If the image was not built using ko, or if it was built without embedding depend
 		Example: `
   # Fetch and extract Go dependency information from an image:
   ko deps docker.io/my-user/my-image:v3`,
-		Args: cobra.ExactArgs(1),
+		Args:       cobra.ExactArgs(1),
+		Deprecated: "SBOMs are generated and uploaded by default; this command will be removed in a future release.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
 			switch sbomType {
 			case "cyclonedx", "spdx", "go.version-m":
 			default:
-				return fmt.Errorf("invalid sbom type %q: must be spdx or go.version-m", sbomType)
+				return fmt.Errorf("invalid sbom type %q: must be spdx, cyclonedx or go.version-m", sbomType)
 			}
 
 			ref, err := name.ParseReference(args[0])
@@ -134,13 +136,13 @@ If the image was not built using ko, or if it was built without embedding depend
 					1)
 				switch sbomType {
 				case "spdx":
-					b, err := sbom.GenerateSPDX(Version, cfg.Created.Time, mod)
+					b, err := sbom.GenerateImageSPDX(Version, mod, signed.Image(img))
 					if err != nil {
 						return err
 					}
 					io.Copy(os.Stdout, bytes.NewReader(b))
 				case "cyclonedx":
-					b, err := sbom.GenerateCycloneDX(mod)
+					b, err := sbom.GenerateImageCycloneDX(mod)
 					if err != nil {
 						return err
 					}
@@ -153,6 +155,6 @@ If the image was not built using ko, or if it was built without embedding depend
 			// unreachable
 		},
 	}
-	deps.Flags().StringVar(&sbomType, "sbom", "spdx", "Format for SBOM output (supports: spdx, go.version-m).")
+	deps.Flags().StringVar(&sbomType, "sbom", "spdx", "Format for SBOM output (supports: spdx, cyclonedx, go.version-m).")
 	topLevel.AddCommand(deps)
 }

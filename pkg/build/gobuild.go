@@ -62,7 +62,8 @@ const (
 type GetBase func(context.Context, string) (name.Reference, Result, error)
 
 type builder func(context.Context, string, string, v1.Platform, Config) (string, error)
-type sbomber func(context.Context, string, string, v1.Image) ([]byte, types.MediaType, error)
+
+type sbomber func(context.Context, string, string, string, oci.SignedEntity, string) ([]byte, types.MediaType, error)
 
 type platformMatcher struct {
 	spec      []string
@@ -76,6 +77,7 @@ type gobuild struct {
 	kodataCreationTime   v1.Time
 	build                builder
 	sbom                 sbomber
+	sbomDir              string
 	disableOptimizations bool
 	trimpath             bool
 	buildConfigs         map[string]Config
@@ -97,6 +99,7 @@ type gobuildOpener struct {
 	kodataCreationTime   v1.Time
 	build                builder
 	sbom                 sbomber
+	sbomDir              string
 	disableOptimizations bool
 	trimpath             bool
 	buildConfigs         map[string]Config
@@ -124,6 +127,7 @@ func (gbo *gobuildOpener) Open() (Interface, error) {
 		kodataCreationTime:   gbo.kodataCreationTime,
 		build:                gbo.build,
 		sbom:                 gbo.sbom,
+		sbomDir:              gbo.sbomDir,
 		disableOptimizations: gbo.disableOptimizations,
 		trimpath:             gbo.trimpath,
 		buildConfigs:         gbo.buildConfigs,
@@ -300,52 +304,121 @@ func build(ctx context.Context, ip string, dir string, platform v1.Platform, con
 	return file, nil
 }
 
-func goversionm(ctx context.Context, file string, appPath string, _ v1.Image) ([]byte, types.MediaType, error) {
-	sbom := bytes.NewBuffer(nil)
-	cmd := exec.CommandContext(ctx, "go", "version", "-m", file)
-	cmd.Stdout = sbom
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return nil, "", err
-	}
+func goversionm(ctx context.Context, file string, appPath string, appFileName string, se oci.SignedEntity, dir string) ([]byte, types.MediaType, error) {
+	switch se.(type) {
+	case oci.SignedImage:
+		sbom := bytes.NewBuffer(nil)
+		cmd := exec.CommandContext(ctx, "go", "version", "-m", file)
+		cmd.Stdout = sbom
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return nil, "", err
+		}
 
-	// In order to get deterministics SBOMs replace our randomized
-	// file name with the path the app will get inside of the container.
-	return []byte(strings.Replace(sbom.String(), file, appPath, 1)), "application/vnd.go.version-m", nil
+		// In order to get deterministics SBOMs replace our randomized
+		// file name with the path the app will get inside of the container.
+		s := []byte(strings.Replace(sbom.String(), file, appPath, 1))
+
+		if err := writeSBOM(s, appFileName, dir, "go.version-m"); err != nil {
+			return nil, "", err
+		}
+
+		return s, "application/vnd.go.version-m", nil
+
+	case oci.SignedImageIndex:
+		return nil, "", nil
+
+	default:
+		return nil, "", fmt.Errorf("unrecognized type: %T", se)
+	}
 }
 
 func spdx(version string) sbomber {
-	return func(ctx context.Context, file string, appPath string, img v1.Image) ([]byte, types.MediaType, error) {
-		b, _, err := goversionm(ctx, file, appPath, img)
-		if err != nil {
-			return nil, "", err
-		}
+	return func(ctx context.Context, file string, appPath string, appFileName string, se oci.SignedEntity, dir string) ([]byte, types.MediaType, error) {
+		switch obj := se.(type) {
+		case oci.SignedImage:
+			b, _, err := goversionm(ctx, file, appPath, appFileName, obj, "")
+			if err != nil {
+				return nil, "", err
+			}
 
-		cfg, err := img.ConfigFile()
-		if err != nil {
-			return nil, "", err
-		}
+			b, err = sbom.GenerateImageSPDX(version, b, obj)
+			if err != nil {
+				return nil, "", err
+			}
 
-		b, err = sbom.GenerateSPDX(version, cfg.Created.Time, b)
-		if err != nil {
-			return nil, "", err
+			if err := writeSBOM(b, appFileName, dir, "spdx.json"); err != nil {
+				return nil, "", err
+			}
+
+			return b, ctypes.SPDXJSONMediaType, nil
+
+		case oci.SignedImageIndex:
+			b, err := sbom.GenerateIndexSPDX(version, obj)
+			if err != nil {
+				return nil, "", err
+			}
+
+			if err := writeSBOM(b, appFileName, dir, "spdx.json"); err != nil {
+				return nil, "", err
+			}
+
+			return b, ctypes.SPDXJSONMediaType, err
+
+		default:
+			return nil, "", fmt.Errorf("unrecognized type: %T", se)
 		}
-		return b, ctypes.SPDXMediaType, nil
 	}
 }
 
-func cycloneDX() sbomber {
-	return func(ctx context.Context, file string, appPath string, img v1.Image) ([]byte, types.MediaType, error) {
-		b, _, err := goversionm(ctx, file, appPath, img)
-		if err != nil {
-			return nil, "", err
+func writeSBOM(sbom []byte, appFileName, dir, ext string) error {
+	if dir != "" {
+		sbomDir := filepath.Clean(dir)
+		if err := os.MkdirAll(sbomDir, os.ModePerm); err != nil {
+			return err
 		}
+		sbomPath := filepath.Join(sbomDir, appFileName+"."+ext)
+		log.Printf("Writing SBOM to %s", sbomPath)
+		return os.WriteFile(sbomPath, sbom, 0644)
+	}
+	return nil
+}
 
-		b, err = sbom.GenerateCycloneDX(b)
-		if err != nil {
-			return nil, "", err
+func cycloneDX() sbomber {
+	return func(ctx context.Context, file string, appPath string, appFileName string, se oci.SignedEntity, dir string) ([]byte, types.MediaType, error) {
+		switch obj := se.(type) {
+		case oci.SignedImage:
+			b, _, err := goversionm(ctx, file, appPath, appFileName, obj, "")
+			if err != nil {
+				return nil, "", err
+			}
+
+			b, err = sbom.GenerateImageCycloneDX(b)
+			if err != nil {
+				return nil, "", err
+			}
+
+			if err := writeSBOM(b, appFileName, dir, "cyclone.json"); err != nil {
+				return nil, "", err
+			}
+
+			return b, ctypes.CycloneDXJSONMediaType, nil
+
+		case oci.SignedImageIndex:
+			b, err := sbom.GenerateIndexCycloneDX(obj)
+			if err != nil {
+				return nil, "", err
+			}
+
+			if err := writeSBOM(b, appFileName, dir, "cyclonedx.json"); err != nil {
+				return nil, "", err
+			}
+
+			return b, ctypes.SPDXJSONMediaType, err
+
+		default:
+			return nil, "", fmt.Errorf("unrecognized type: %T", se)
 		}
-		return b, ctypes.CycloneDXMediaType, nil
 	}
 }
 
@@ -613,7 +686,9 @@ func (g *gobuild) tarKoData(ref reference, platform *v1.Platform) (*bytes.Buffer
 }
 
 func createTemplateData() map[string]interface{} {
-	envVars := map[string]string{}
+	envVars := map[string]string{
+		"LDFLAGS": "",
+	}
 	for _, entry := range os.Environ() {
 		kv := strings.SplitN(entry, "=", 2)
 		envVars[kv[0]] = kv[1]
@@ -663,6 +738,16 @@ func createBuildArgs(buildCfg Config) ([]string, error) {
 		args = append(args, fmt.Sprintf("-ldflags=%s", strings.Join(buildCfg.Ldflags, " ")))
 	}
 
+	// Reject any flags that attempt to set --toolexec (with or
+	// without =, with one or two -s)
+	for _, a := range args {
+		for _, d := range []string{"-", "--"} {
+			if a == d+"toolexec" || strings.HasPrefix(a, d+"toolexec=") {
+				return nil, fmt.Errorf("cannot set %s", a)
+			}
+		}
+	}
+
 	return args, nil
 }
 
@@ -694,6 +779,20 @@ func (g *gobuild) buildOne(ctx context.Context, refStr string, base v1.Image, pl
 
 	ref := newRef(refStr)
 
+	// Layers should be typed to match the underlying image, since some
+	// registries reject mixed-type layers.
+	var layerMediaType types.MediaType
+	mt, err := base.MediaType()
+	if err != nil {
+		return nil, err
+	}
+	switch mt {
+	case types.OCIManifestSchema1:
+		layerMediaType = types.OCILayer
+	case types.DockerManifestSchema2:
+		layerMediaType = types.DockerLayer
+	}
+
 	cf, err := base.ConfigFile()
 	if err != nil {
 		return nil, err
@@ -706,6 +805,9 @@ func (g *gobuild) buildOne(ctx context.Context, refStr string, base v1.Image, pl
 		}
 	}
 
+	if !g.platformMatcher.matches(platform) {
+		return nil, fmt.Errorf("base image platform %q does not match desired platforms %v", platform, g.platformMatcher.platforms)
+	}
 	// Do the build into a temporary file.
 	file, err := g.build(ctx, ref.Path(), g.dir, *platform, g.configForImportPath(ref.Path()))
 	if err != nil {
@@ -725,7 +827,7 @@ func (g *gobuild) buildOne(ctx context.Context, refStr string, base v1.Image, pl
 	dataLayerBytes := dataLayerBuf.Bytes()
 	dataLayer, err := tarball.LayerFromOpener(func() (io.ReadCloser, error) {
 		return ioutil.NopCloser(bytes.NewBuffer(dataLayerBytes)), nil
-	}, tarball.WithCompressedCaching)
+	}, tarball.WithCompressedCaching, tarball.WithMediaType(layerMediaType))
 	if err != nil {
 		return nil, err
 	}
@@ -740,10 +842,11 @@ func (g *gobuild) buildOne(ctx context.Context, refStr string, base v1.Image, pl
 	})
 
 	appDir := "/ko-app"
-	appPath := path.Join(appDir, appFilename(ref.Path()))
+	appFileName := appFilename(ref.Path())
+	appPath := path.Join(appDir, appFileName)
 
 	miss := func() (v1.Layer, error) {
-		return buildLayer(appPath, file, platform)
+		return buildLayer(appPath, file, platform, layerMediaType)
 	}
 
 	binaryLayer, err := g.cache.get(ctx, file, miss)
@@ -752,7 +855,8 @@ func (g *gobuild) buildOne(ctx context.Context, refStr string, base v1.Image, pl
 	}
 
 	layers = append(layers, mutate.Addendum{
-		Layer: binaryLayer,
+		Layer:     binaryLayer,
+		MediaType: layerMediaType,
 		History: v1.History{
 			Author:    "ko",
 			Created:   g.creationTime,
@@ -776,15 +880,16 @@ func (g *gobuild) buildOne(ctx context.Context, refStr string, base v1.Image, pl
 
 	cfg = cfg.DeepCopy()
 	cfg.Config.Entrypoint = []string{appPath}
+	cfg.Config.Cmd = nil
 	if platform.OS == "windows" {
-		cfg.Config.Entrypoint = []string{`C:\ko-app\` + appFilename(ref.Path())}
+		cfg.Config.Entrypoint = []string{`C:\ko-app\` + appFileName}
 		updatePath(cfg, `C:\ko-app`)
 		cfg.Config.Env = append(cfg.Config.Env, `KO_DATA_PATH=C:\var\run\ko`)
 	} else {
 		updatePath(cfg, appDir)
 		cfg.Config.Env = append(cfg.Config.Env, "KO_DATA_PATH="+kodataRoot)
 	}
-	cfg.Author = "github.com/google/ko"
+	cfg.Author = "github.com/ko-build/ko"
 
 	if cfg.Config.Labels == nil {
 		cfg.Config.Labels = map[string]string{}
@@ -806,7 +911,7 @@ func (g *gobuild) buildOne(ctx context.Context, refStr string, base v1.Image, pl
 	si := signed.Image(image)
 
 	if g.sbom != nil {
-		sbom, mt, err := g.sbom(ctx, file, appPath, image)
+		sbom, mt, err := g.sbom(ctx, file, appPath, appFileName, si, g.sbomDir)
 		if err != nil {
 			return nil, err
 		}
@@ -822,7 +927,7 @@ func (g *gobuild) buildOne(ctx context.Context, refStr string, base v1.Image, pl
 	return si, nil
 }
 
-func buildLayer(appPath, file string, platform *v1.Platform) (v1.Layer, error) {
+func buildLayer(appPath, file string, platform *v1.Platform, layerMediaType types.MediaType) (v1.Layer, error) {
 	// Construct a tarball with the binary and produce a layer.
 	binaryLayerBuf, err := tarBinary(appPath, file, platform)
 	if err != nil {
@@ -834,7 +939,7 @@ func buildLayer(appPath, file string, platform *v1.Platform) (v1.Layer, error) {
 	}, tarball.WithCompressedCaching, tarball.WithEstargzOptions(estargz.WithPrioritizedFiles([]string{
 		// When using estargz, prioritize downloading the binary entrypoint.
 		appPath,
-	})))
+	})), tarball.WithMediaType(layerMediaType))
 }
 
 // Append appPath to the PATH environment variable, if it exists. Otherwise,
@@ -874,49 +979,41 @@ func (g *gobuild) Build(ctx context.Context, s string) (Result, error) {
 		return nil, err
 	}
 
-	// Take the digest of the base index or image, to annotate images we'll build later.
-	baseDigest, err := base.Digest()
-	if err != nil {
-		return nil, err
-	}
-
 	// Annotate the base image we pass to the build function with
 	// annotations indicating the digest (and possibly tag) of the
 	// base image.  This will be inherited by the image produced.
 	if mt != types.DockerManifestList {
+		baseDigest, err := base.Digest()
+		if err != nil {
+			return nil, err
+		}
+
 		anns := map[string]string{
 			specsv1.AnnotationBaseImageDigest: baseDigest.String(),
-		}
-		if _, ok := baseRef.(name.Tag); ok {
-			anns[specsv1.AnnotationBaseImageName] = baseRef.Name()
+			specsv1.AnnotationBaseImageName:   baseRef.Name(),
 		}
 		base = mutate.Annotations(base, anns).(Result)
 	}
 
-	var res Result
 	switch mt {
 	case types.OCIImageIndex, types.DockerManifestList:
 		baseIndex, ok := base.(v1.ImageIndex)
 		if !ok {
 			return nil, fmt.Errorf("failed to interpret base as index: %v", base)
 		}
-		res, err = g.buildAll(ctx, s, baseIndex)
+		return g.buildAll(ctx, s, baseRef, baseIndex)
 	case types.OCIManifestSchema1, types.DockerManifestSchema2:
 		baseImage, ok := base.(v1.Image)
 		if !ok {
 			return nil, fmt.Errorf("failed to interpret base as image: %v", base)
 		}
-		res, err = g.buildOne(ctx, s, baseImage, nil)
+		return g.buildOne(ctx, s, baseImage, nil)
 	default:
 		return nil, fmt.Errorf("base image media type: %s", mt)
 	}
-	if err != nil {
-		return nil, err
-	}
-	return res, nil
 }
 
-func (g *gobuild) buildAll(ctx context.Context, ref string, baseIndex v1.ImageIndex) (Result, error) {
+func (g *gobuild) buildAll(ctx context.Context, ref string, baseRef name.Reference, baseIndex v1.ImageIndex) (Result, error) {
 	im, err := baseIndex.IndexManifest()
 	if err != nil {
 		return nil, err
@@ -943,6 +1040,12 @@ func (g *gobuild) buildAll(ctx context.Context, ref string, baseIndex v1.ImageIn
 		if err != nil {
 			return nil, fmt.Errorf("error getting matching image from index: %w", err)
 		}
+		// Decorate the image with the ref of the index, and the matching
+		// platform's digest.
+		img = mutate.Annotations(img, map[string]string{
+			specsv1.AnnotationBaseImageDigest: matches[0].Digest.String(),
+			specsv1.AnnotationBaseImageName:   baseRef.Name(),
+		}).(v1.Image)
 		return g.buildOne(ctx, ref, img, matches[0].Platform)
 	}
 
@@ -958,6 +1061,29 @@ func (g *gobuild) buildAll(ctx context.Context, ref string, baseIndex v1.ImageIn
 			if err != nil {
 				return err
 			}
+
+			// Decorate the image with the ref of the index, and the matching
+			// platform's digest.  The ref of the index encodes the critical
+			// repository information for fetching the base image's digest, but
+			// we leave `name` pointing at the index's full original ref to that
+			// folks could conceivably check for updates to the index over time.
+			// While the `digest` doesn't give us enough information to check
+			// for changes with a simple HEAD (because we need the full index
+			// manifest to get the per-architecture image), that optimization
+			// mainly matters for DockerHub where HEAD's are exempt from rate
+			// limiting.  However, in practice, the way DockerHub updates the
+			// indices for official images is to rebuild per-arch images and
+			// replace the per-arch images in the existing index, so an index
+			// with N manifest receives N updates.  If we only record the digest
+			// of the index here, then we cannot tell when the index updates are
+			// no-ops for us because we didn't record the digest of the actual
+			// image we used, and we would potentially end up doing Nx more work
+			// than we really need to do.
+			baseImage = mutate.Annotations(baseImage, map[string]string{
+				specsv1.AnnotationBaseImageDigest: desc.Digest.String(),
+				specsv1.AnnotationBaseImageName:   baseRef.Name(),
+			}).(v1.Image)
+
 			img, err := g.buildOne(ctx, ref, baseImage, desc.Platform)
 			if err != nil {
 				return err
@@ -982,10 +1108,30 @@ func (g *gobuild) buildAll(ctx context.Context, ref string, baseIndex v1.ImageIn
 	if err != nil {
 		return nil, err
 	}
-	idx := ocimutate.AppendManifests(mutate.IndexMediaType(empty.Index, baseType), adds...)
 
-	// TODO(mattmoor): If we want to attach anything (e.g. signatures, attestations, SBOM)
-	// at the index level, we would do it here!
+	idx := ocimutate.AppendManifests(
+		mutate.Annotations(
+			mutate.IndexMediaType(empty.Index, baseType),
+			im.Annotations).(v1.ImageIndex),
+		adds...)
+
+	if g.sbom != nil {
+		sbom, mt, err := g.sbom(ctx, "", "", "", idx, g.sbomDir)
+		if err != nil {
+			return nil, err
+		}
+		if sbom != nil {
+			f, err := static.NewFile(sbom, static.WithLayerMediaType(mt))
+			if err != nil {
+				return nil, err
+			}
+			idx, err = ocimutate.AttachFileToImageIndex(idx, "sbom", f)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	return idx, nil
 }
 

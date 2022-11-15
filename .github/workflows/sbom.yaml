@@ -1,8 +1,11 @@
 name: Validate SBOMs
 
 on:
-  pull_request: 
+  pull_request:
     branches: ['main']
+
+env:
+  SPDX_TOOLS_VERSION: 1.1.0
 
 jobs:
   go-version-m:
@@ -13,14 +16,12 @@ jobs:
       KO_DOCKER_REPO: localhost:1338
 
     steps:
-      - uses: actions/setup-go@v2
+      - uses: actions/setup-go@v3
         with:
-          go-version: '1.17.x'
-      - name: Install cmd/registry
-        run: |
-          go install github.com/google/go-containerregistry/cmd/registry@latest
-          registry &
-      - uses: actions/checkout@v2
+          go-version: 1.18
+          check-latest: true
+      - uses: chainguard-dev/actions/setup-registry@main
+      - uses: actions/checkout@v3
 
       - name: Generate
         run: |
@@ -36,16 +37,14 @@ jobs:
       KO_DOCKER_REPO: localhost:1338
 
     steps:
-      - uses: actions/setup-go@v2
+      - uses: actions/setup-go@v3
         with:
-          go-version: '1.17.x'
-      - name: Install cmd/registry
-        run: |
-          go install github.com/google/go-containerregistry/cmd/registry@latest
-          registry &
-      - uses: actions/checkout@v2
+          go-version: 1.18
+          check-latest: true
+      - uses: chainguard-dev/actions/setup-registry@main
+      - uses: actions/checkout@v3
 
-      - name: Install CycloneDX 
+      - name: Install CycloneDX
         run: |
           wget https://github.com/CycloneDX/cyclonedx-cli/releases/download/v0.22.0/cyclonedx-linux-x64
           chmod +x cyclonedx-linux-x64
@@ -53,14 +52,14 @@ jobs:
       - name: Generate and Validate
         run: |
           img=$(go run ./ build ./)
-          go run ./ deps $img --sbom=cyclonedx > sbom.json
-          ./cyclonedx-linux-x64 validate --input-file=sbom.json --fail-on-errors
+          go run ./ deps $img --sbom=cyclonedx > cyclonedx.json
+          ./cyclonedx-linux-x64 validate --input-file=cyclonedx.json --fail-on-errors
 
-      - uses: actions/upload-artifact@v2
+      - uses: actions/upload-artifact@v3
         if: ${{ always() }}
         with:
-          name: sbom.json
-          path: sbom.json
+          name: cyclonedx.json
+          path: cyclonedx.json
 
   spdx:
     name: Validate SPDX SBOM
@@ -70,29 +69,65 @@ jobs:
       KO_DOCKER_REPO: localhost:1338
 
     steps:
-      - uses: actions/setup-go@v2
+      - uses: actions/setup-go@v3
         with:
-          go-version: '1.17.x'
-      - name: Install cmd/registry
-        run: |
-          go install github.com/google/go-containerregistry/cmd/registry@latest
-          registry &
-      - uses: actions/checkout@v2
+          go-version: 1.18
+          check-latest: true
+      - uses: chainguard-dev/actions/setup-registry@main
+      - uses: actions/checkout@v3
 
       - name: Install SPDX Tools
         run: |
-          wget https://github.com/spdx/tools/releases/download/v2.2.7/spdx-tools-2.2.7.zip
-          unzip spdx-tools-2.2.7.zip
+          wget https://github.com/spdx/tools-java/releases/download/v${SPDX_TOOLS_VERSION}/tools-java-${SPDX_TOOLS_VERSION}.zip
+          unzip tools-java-${SPDX_TOOLS_VERSION}.zip
 
       - name: Generate and Validate
         run: |
           img=$(go run ./ build ./)
-          go run ./ deps $img --sbom=spdx > sbom.txt
+          go run ./ deps $img --sbom=spdx | tee spdx.json
 
-          java -jar ./spdx-tools-2.2.7-jar-with-dependencies.jar Verify sbom.txt
+          java -jar ./tools-java-${SPDX_TOOLS_VERSION}-jar-with-dependencies.jar Verify spdx.json
 
-      - uses: actions/upload-artifact@v2
+      - uses: actions/upload-artifact@v3
         if: ${{ always() }}
         with:
-          name: sbom.txt
-          path: sbom.txt
+          name: spdx.json
+          path: spdx.json
+
+  spdx-multi-arch:
+    name: Validate SPDX multi-arch SBOM
+    runs-on: ubuntu-latest
+
+    env:
+      KO_DOCKER_REPO: localhost:1338
+
+    steps:
+      - uses: actions/setup-go@v3
+        with:
+          go-version: 1.18
+          check-latest: true
+      - uses: chainguard-dev/actions/setup-registry@main
+      - uses: actions/checkout@v3
+
+      - name: Install SPDX Tools
+        run: |
+          wget https://github.com/spdx/tools-java/releases/download/v${SPDX_TOOLS_VERSION}/tools-java-${SPDX_TOOLS_VERSION}.zip
+          unzip tools-java-${SPDX_TOOLS_VERSION}.zip
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v2.8.1
+        with:
+          cosign-release: 'v1.7.2'
+
+      - name: Generate and Validate
+        run: |
+          img=$(go run ./ build --platform=linux/amd64,linux/arm64 ./)
+          cosign download sbom $img | tee spdx-multi-arch.json
+
+          java -jar ./tools-java-${SPDX_TOOLS_VERSION}-jar-with-dependencies.jar Verify spdx-multi-arch.json
+
+      - uses: actions/upload-artifact@v3
+        if: ${{ always() }}
+        with:
+          name: spdx-multi-arch.json
+          path: spdx-multi-arch.json

@@ -49,6 +49,10 @@ func addRun(topLevel *cobra.Command) {
   # You can also supply args and flags to the command.
   ko run ./cmd/baz -- -v arg1 arg2 --yes`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := options.Validate(po, bo); err != nil {
+				return fmt.Errorf("validating options: %w", err)
+			}
+
 			ctx := cmd.Context()
 
 			if bo.WorkingDirectory != "" {
@@ -69,8 +73,8 @@ func addRun(topLevel *cobra.Command) {
 
 			kubectlArgs := []string{}
 			dashes = unparsedDashes()
-			if dashes != -1 {
-				kubectlArgs = os.Args[dashes:]
+			if dashes != -1 && dashes != len(os.Args) {
+				kubectlArgs = os.Args[dashes+1:]
 			}
 
 			bo.InsecureRegistry = po.InsecureRegistry
@@ -104,7 +108,6 @@ func addRun(topLevel *cobra.Command) {
 
 				// These are better defaults:
 				defaults := []string{
-					"--generator=run-pod/v1",   // create a pod instead of deployment
 					"--attach",                 // stream logs back
 					"--rm",                     // clean up after ourselves
 					"--restart=Never",          // we just want to run once

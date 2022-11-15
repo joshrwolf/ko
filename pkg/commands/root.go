@@ -20,6 +20,7 @@ import (
 	cranecmd "github.com/google/go-containerregistry/cmd/crane/cmd"
 	"github.com/google/go-containerregistry/pkg/logs"
 	"github.com/spf13/cobra"
+	"go.uber.org/automaxprocs/maxprocs"
 )
 
 var Root = New()
@@ -37,6 +38,8 @@ func New() *cobra.Command {
 				logs.Debug.SetOutput(os.Stderr)
 			}
 			logs.Progress.SetOutput(os.Stderr)
+
+			maxprocs.Set(maxprocs.Logger(logs.Debug.Printf))
 		},
 		Run: func(cmd *cobra.Command, args []string) {
 			cmd.Help()
@@ -48,7 +51,7 @@ func New() *cobra.Command {
 
 	// Also add the auth group from crane to facilitate logging into a
 	// registry.
-	authCmd := cranecmd.NewCmdAuth("ko", "auth")
+	authCmd := cranecmd.NewCmdAuth(nil, "ko", "auth")
 	// That was a mistake, but just set it to Hidden so we don't break people.
 	authCmd.Hidden = true
 	root.AddCommand(authCmd)
