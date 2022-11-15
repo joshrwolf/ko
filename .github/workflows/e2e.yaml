@@ -61,6 +61,10 @@ jobs:
         testimg=$(go run ./ build ./test --platform=${PLATFORM} --preserve-import-paths)
         docker run ${testimg} --wait=false 2>&1 | tee >(grep "Hello there") # Log all output too.
 
+        # Build and run the test/ binary from the repo root (to test alternative working directories)
+        wdtestimg=$(go run ./ build -C ./test ./ --platform=${PLATFORM} --preserve-import-paths)
+        docker run ${wdtestimg} --wait=false 2>&1 | grep "Hello there"
+
         # Check that symlinks in kodata are chased.
         # Skip this test on Windows.
         if [[ "$RUNNER_OS" == "Linux" ]]; then
